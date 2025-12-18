@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="card">
+    <h1>Рекомендации по переезду</h1>
+    <div class="small">
+      Маршрут: <span class="pill">{{ origin.label if origin else "Краснодар" }}</span>
+      → <span class="pill">{{ destination.label if destination else "—" }}</span>
+      &nbsp;|&nbsp; Тип: <span class="pill">{{ move_type_label }}</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Вещи</h2>
+    <div>Количество предметов: <span class="pill">{{ n_items }}</span></div>
+    <div class="small">Есть хрупкие: <span class="pill">{{ "да" if fragile_any else "нет" }}</span></div>
+
+    {% if items and items|length > 0 %}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Название</th><th>Объём, л</th><th>Хрупкий</th></tr></thead>
+        <tbody>
+          {% for it in items %}
+            <tr>
+              <td>{{ it.name }}</td>
+              <td>{{ "%.1f"|format(it.volume) }}</td>
+              <td>{{ "да" if it.fragile else "нет" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="small" style="margin-top:8px;">Список не указан — расчёт выполнен по количеству.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Бюджет</h2>
+    <table>
+      <tbody>
+        <tr><td>Оценочная стоимость услуг</td><td class="mono">{{ total_cost }} ₽</td></tr>
+        <tr><td>Оценка расходов пользователя (с учётом покрытия работодателя)</td><td class="mono">{{ out_of_pocket }} ₽</td></tr>
+        <tr><td>Рекомендуемый бюджет (с запасом 15%)</td><td class="mono"><strong>{{ recommended_budget }} ₽</strong></td></tr>
+        <tr><td>Ваш желаемый бюджет</td><td class="mono">{{ desired_budget }} ₽</td></tr>
+      </tbody>
+    </table>
+
+    {% if delta >= 0 %}
+      <div class="small ok">Ваш желаемый бюджет выше/равен рекомендованному на {{ delta }} ₽.</div>
+    {% else %}
+      <div class="small bad">Ваш желаемый бюджет ниже рекомендованного на {{ (-delta) }} ₽.</div>
+    {% endif %}
+
+    <h2 style="margin-top:14px;">Услуги (из онтологии)</h2>
+    <table>
+      <thead><tr><th>Услуга</th><th>Расчёт</th></tr></thead>
+      <tbody>
+        {% for s in services %}
+          <tr>
+            <td>{{ s.name }}</td>
+            <td class="small">
+              базовая {{ s.base_price }} + {{ s.per_item_price }}×N,
+              {% if move_type == "INTERNATIONAL" %}
+                × коэф. {{ s.intl_coef }}
+              {% else %}
+                без коэф.
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Рекомендованные даты</h2>
+    <div>Дата начала: <span class="pill">{{ start_date.isoformat() }}</span></div>
+    <div>Рекомендованная дата переезда: <span class="pill">{{ recommended_move_date.isoformat() }}</span></div>
+
+    {% if desired_move_date %}
+      {% if feasible %}
+        <div class="small ok">Ваша желаемая дата {{ desired_move_date.isoformat() }} реалистична по этому плану.</div>
+      {% else %}
+        <div class="small warn">Ваша желаемая дата {{ desired_move_date.isoformat() }} слишком ранняя; по плану лучше {{ recommended_move_date.isoformat() }} или позже.</div>
+      {% endif %}
+    {% endif %}
+
+    <h2 style="margin-top:14px;">График задач</h2>
+    <table>
+      <thead><tr><th>Задача</th><th>Период</th><th>Описание</th></tr></thead>
+      <tbody>
+        {% for row in schedule %}
+          <tr>
+            <td>{{ row.task.label }}</td>
+            <td class="mono">{{ row.start.isoformat() }} → {{ row.end.isoformat() }}</td>
+            <td class="small">{{ row.task.description }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="small" style="margin-top:10px;">
+      Примечание: длительности — «ориентиры». Мы можем улучшить модель: учитывать объём вещей, расстояния, доступность дат, визовые сроки и т.д.
+    </div>
+  </div>
+
+  <div style="display:flex; gap:10px;">
+    <a class="btn secondary" href="/">Назад</a>
+  </div>
+{% endblock %}
