@@ -1,512 +1,556 @@
-import sys
 import pygame
+import sys
+import math
 from collections import deque
 
+# -------------------- Constants (variant 30) --------------------
 ADC_BITS = 8
+ADC_VREF = 19.5  # V, input range 0..19.5
+ADC_MAX = (1 << ADC_BITS) - 1
+
 DAC_BITS = 8
+DAC_VMAX = 120.0  # V, output range 0..120
+DAC_MAX = (1 << DAC_BITS) - 1
 
-ADC_U_MIN = 0.0
-ADC_U_MAX = 19.5
+U_NOM = 116.0
+U_HALF = U_NOM * 0.5
+U_SLOW = U_NOM * 0.3
 
-DAC_U_MIN = 0.0
-DAC_U_MAX = 120.0
+CODE_NOM = round(U_NOM / DAC_VMAX * DAC_MAX)   # ~247
+CODE_HALF = round(U_HALF / DAC_VMAX * DAC_MAX) # ~123-124
+CODE_SLOW = round(U_SLOW / DAC_VMAX * DAC_MAX) # ~74
+CODE_ZERO = 0
 
-U_NOM = 116.0  # nominal drive voltage
+# Tensometric sensor: 0..120 kgf/mm^2 -> 0..15 V
+TENSO_MAX = 120.0
+TENSO_U_MAX = 15.0
 
-T_RAMP_UP = 12.0   #0 -> 116 in 12 s
-T_RAMP_DOWN = 5.0  # 116 -> 0 in 5 s
+TH_55 = 55.0
+TH_70 = 70.0
+TH_95 = 95.0
 
-# Gate travel model
-POS_MIN = 0.0     # 0% = fully closed
-POS_MAX = 100.0   # 100% = fully open
+RAMP_UP_SEC = 12.0    # Fig B.8a
+RAMP_DOWN_SEC = 5.0   # Fig B.8b
 
-OPEN_SPEED_AT_NOM = (POS_MAX - POS_MIN) / 12.0
-CLOSE_SPEED_AT_NOM = (POS_MAX - POS_MIN) / 5.0
+SAMPLE_PERIOD = 0.25  # like driver step
+MAX_LOG_LINES = 12
 
-KV_OPEN1_POS = 90.0
-KV_OPEN2_POS = 100.0
-KV_CLOSE1_POS = 10.0
-KV_CLOSE2_POS = 0.0
+# Gate kinematics (just for visualization)
+# Full travel at 116V takes ~30 seconds
+TRAVEL_TIME_AT_NOM = 30.0
+BASE_SPEED = 1.0 / TRAVEL_TIME_AT_NOM
 
-# аварийные пороги по усилию
-F_SLOW_ON = 70.0
-F_SLOW_OFF = 55.0
-F_STOP = 114.0
+OPEN1_POS = 0.80
+OPEN2_POS = 1.00
+CLOSE1_POS = 0.20
+CLOSE2_POS = 0.00
 
-TEN_F_MIN = 0.0
-TEN_F_MAX = 120.0
-TEN_U_MIN = 0.0
-TEN_U_MAX = 15.0
+# UI
+W, H = 1600, 900
 
-SLOW_KV_FACTOR = 0.5
-SLOW_FORCE_FACTOR = 0.30
+# Bit mapping for visualization (as in your scheme)
+# Port 300h (input):
+# bit15 GT, bit14 KZ, bit13 KO, bit12 US(OR), bit11 KV_Z2, bit10 KV_Z1, bit9 KV_O2, bit8 KV_O1, bits7..0 ADC
+# Port 301h (output):
+# bits7..0 DAC, bit14 ZP_DAC, bit15 ZP_ADC
 
+# -------------------- Helpers --------------------
 def clamp(x, a, b):
-    return max(a, min(b, x))
+    return a if x < a else b if x > b else x
 
+def tenso_to_voltage(stress):
+    return (stress / TENSO_MAX) * TENSO_U_MAX
 
 def adc_code_from_voltage(u):
-    u = clamp(u, ADC_U_MIN, ADC_U_MAX)
-    code = int(round((u - ADC_U_MIN) * ((2 ** ADC_BITS - 1) / (ADC_U_MAX - ADC_U_MIN))))
-    return clamp(code, 0, 2 ** ADC_BITS - 1)
+    # 8-bit, range 0..19.5V
+    u = clamp(u, 0.0, ADC_VREF)
+    return int(round(u / ADC_VREF * ADC_MAX))
 
+def dac_voltage_from_code(code):
+    return (code / DAC_MAX) * DAC_VMAX
 
-def dac_code_from_voltage(u):
-    u = clamp(u, DAC_U_MIN, DAC_U_MAX)
-    code = int(round((u - DAC_U_MIN) * ((2 ** DAC_BITS - 1) / (DAC_U_MAX - DAC_U_MIN))))
-    return clamp(code, 0, 2 ** DAC_BITS - 1)
+def fmt_bool(v):
+    return "1" if v else "0"
 
-
-def ten_voltage_from_force(f):
-    f = clamp(f, TEN_F_MIN, TEN_F_MAX)
-    return TEN_U_MIN + (f - TEN_F_MIN) * (TEN_U_MAX - TEN_U_MIN) / (TEN_F_MAX - TEN_F_MIN)
-
-
-def hex16(x):
-    return f"0x{x & 0xFFFF:04X}"
-
-
-def hex8(x):
-    return f"0x{x & 0xFF:02X}"
-
-
-def wrap_lines(s, font, max_w):
-    words = s.split(" ")
-    lines = []
-    cur = ""
-    for w in words:
-        test = (cur + " " + w).strip()
-        if font.size(test)[0] <= max_w:
-            cur = test
-        else:
-            if cur:
-                lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-class LinearProfile:
-    def __init__(self, u0, u1, duration):
-        self.u0 = float(u0)
-        self.u1 = float(u1)
-        self.duration = max(0.001, float(duration))
+# -------------------- Ramp controller --------------------
+class Ramp:
+    def __init__(self):
+        self.active = False
+        self.start_code = 0
+        self.end_code = 0
+        self.duration = 0.0
         self.t = 0.0
-        self.done = False
 
-    def step(self, dt):
-        if self.done:
-            return self.u1
+    def start(self, current_code, target_code, duration):
+        self.active = True
+        self.start_code = int(current_code)
+        self.end_code = int(target_code)
+        self.duration = max(1e-6, float(duration))
+        self.t = 0.0
+
+    def update(self, dt):
+        if not self.active:
+            return self.end_code, False
         self.t += dt
         k = clamp(self.t / self.duration, 0.0, 1.0)
-        u = self.u0 + (self.u1 - self.u0) * k
-        if k >= 1.0:
-            self.done = True
-        return u
+        code = int(round(self.start_code + (self.end_code - self.start_code) * k))
+        done = (k >= 1.0)
+        if done:
+            self.active = False
+        return code, done
 
+# -------------------- Main system --------------------
+class GateSystem:
+    def __init__(self, log_cb):
+        self.log = log_cb
 
-class GateController:
-    def __init__(self):
-        self.state = "IDLE"  # IDLE / OPENING / CLOSING / STOPPED
-        self.direction = 0   # 0 close, 1 open
-        self.u_cmd = 0.0
+        self.state = "IDLE"       # IDLE / OPENING / CLOSING / STOPPED
+        self.direction = 0        # +1 open, -1 close, 0 none
+        self.position = 0.0       # 0 closed .. 1 open
 
-        self.slow_force = False
-        self.slow_kv = False
+        self.uz1 = False
+        self.uz2 = False
+        self.stress = 0.0
 
-        self.profile = None
-        self.stop_latched = False  # for авария 1/3: require operator restart
+        self.ko = False
+        self.kz = False
 
-        self.adc_start_pulse = 0.0
-        self.dac_start_pulse = 0.0
+        self.kv_o1 = False
+        self.kv_o2 = False
+        self.kv_z1 = True
+        self.kv_z2 = True
 
-        self.log = deque(maxlen=18)
-        self.runtime = 0.0
+        self.slow_mode_30 = False  # авария №2 active (30%)
 
-    def push_log(self, s):
-        self.log.appendleft(s)
+        self.dac_code = 0
+        self.target_code = 0
 
-    def set_profile(self, target, duration):
-        self.profile = LinearProfile(self.u_cmd, target, duration)
+        self.ramp = Ramp()
 
-    def request_open(self):
-        self.stop_latched = False
-        self.state = "OPENING"
-        self.direction = 1
-        self.slow_kv = False
-        self.set_profile(U_NOM, T_RAMP_UP)
-        self.push_log("Кнопка ОТКРЫТЬ: запуск (разгон по Б.8а)")
+        self.sample_timer = 0.0
 
-    def request_close(self):
-        self.stop_latched = False
-        self.state = "CLOSING"
-        self.direction = 0
-        self.slow_kv = False
-        self.set_profile(U_NOM, T_RAMP_UP)
-        self.push_log("Кнопка ЗАКРЫТЬ: запуск (разгон по Б.8а)")
+        # pulses for port display (one-sample tick)
+        self.zp_adc_pulse = False
+        self.zp_dac_pulse = False
+        self.gt_flag = True  # in model we consider ADC ready after sampling
+
+    def reset_sensors(self):
+        self.uz1 = False
+        self.uz2 = False
+        self.stress = 0.0
+        self.log("Сброс датчиков: УЗ1=0 УЗ2=0 усилие=0")
+
+    def press_open(self):
+        self.ko = True
+        self.kz = False
+        if self.state in ("IDLE", "STOPPED"):
+            self.state = "OPENING"
+            self.direction = +1
+            self.slow_mode_30 = False
+            self.log("Кнопка ОТКРЫТИЯ: старт OPENING, разгон 0→116В за 12с")
+            self.start_ramp(self.nominal_target_code(), RAMP_UP_SEC)
+
+    def press_close(self):
+        self.kz = True
+        self.ko = False
+        if self.state in ("IDLE", "STOPPED"):
+            self.state = "CLOSING"
+            self.direction = -1
+            self.slow_mode_30 = False
+            self.log("Кнопка ЗАКРЫТИЯ: старт CLOSING, разгон 0→116В за 12с")
+            self.start_ramp(self.nominal_target_code(), RAMP_UP_SEC)
+
+    def start_ramp(self, target_code, duration):
+        target_code = int(clamp(target_code, 0, 255))
+        if target_code == self.target_code and self.ramp.active:
+            return
+        self.target_code = target_code
+        self.ramp.start(self.dac_code, self.target_code, duration)
+        self.zp_dac_pulse = True
+
+    def nominal_target_code(self):
+        # Номинальная цель зависит от концевика №1: если он уже сработал -> 50%, иначе 116%
+        if self.state == "OPENING":
+            return CODE_HALF if self.kv_o1 else CODE_NOM
+        if self.state == "CLOSING":
+            return CODE_HALF if self.kv_z1 else CODE_NOM
+        return CODE_ZERO
+
+    def update_limits_from_position(self):
+        # limits computed from position
+        self.kv_o1 = (self.position >= OPEN1_POS)
+        self.kv_o2 = (self.position >= OPEN2_POS)
+
+        self.kv_z1 = (self.position <= CLOSE1_POS)
+        self.kv_z2 = (self.position <= CLOSE2_POS)
+
+    def build_port300(self, adc_code):
+        us_or = self.uz1 or self.uz2
+        v = 0
+        v |= (adc_code & 0xFF)
+        v |= (1 if self.kv_o1 else 0) << 8
+        v |= (1 if self.kv_o2 else 0) << 9
+        v |= (1 if self.kv_z1 else 0) << 10
+        v |= (1 if self.kv_z2 else 0) << 11
+        v |= (1 if us_or else 0) << 12
+        v |= (1 if self.ko else 0) << 13
+        v |= (1 if self.kz else 0) << 14
+        v |= (1 if self.gt_flag else 0) << 15
+        return v
+
+    def build_port301(self):
+        v = 0
+        v |= (self.dac_code & 0xFF)
+        v |= (1 if self.zp_dac_pulse else 0) << 14
+        v |= (1 if self.zp_adc_pulse else 0) << 15
+        return v
 
     def emergency_stop(self, reason):
-        if not self.stop_latched:
-            self.push_log(f"СТОП: {reason} (перезапуск только кнопкой)")
-        self.stop_latched = True
+        if self.state != "STOPPED":
+            self.log(f"АВАРИЯ: {reason} → останов по рис.Б.8б (5с до 0)")
         self.state = "STOPPED"
-        self.slow_force = False
-        self.slow_kv = False
-        self.set_profile(0.0, T_RAMP_DOWN)
+        self.direction = 0
+        self.slow_mode_30 = False
+        self.start_ramp(CODE_ZERO, RAMP_DOWN_SEC)
 
-    def apply_slow_force(self):
-        if not self.slow_force:
-            self.slow_force = True
-            self.push_log("АС2: усилие >= 70 -> замедление до 30% (Б.8б)")
-        self.set_profile(U_NOM * SLOW_FORCE_FACTOR, T_RAMP_DOWN)
+    def normal_stop_to_zero(self, reason):
+        self.log(f"{reason} → по рис.Б.8б (5с до 0)")
+        self.direction = 0
+        self.slow_mode_30 = False
+        self.start_ramp(CODE_ZERO, RAMP_DOWN_SEC)
 
-    def release_slow_force(self):
-        if self.slow_force:
-            self.slow_force = False
-            self.push_log("АС2: усилие < 55 -> восстановление скорости (Б.8а)")
-        self.set_profile(U_NOM, T_RAMP_UP)
+    def control_step(self):
+        # This step mimics "poll + analysis + output"
+        self.zp_adc_pulse = True
+        self.gt_flag = True
 
-    def apply_slow_kv(self):
-        if not self.slow_kv:
-            self.slow_kv = True
-            self.push_log("КВ1: замедление до 50% (Б.8б)")
-        self.set_profile(U_NOM * SLOW_KV_FACTOR, T_RAMP_DOWN)
+        stress_u = tenso_to_voltage(self.stress)
+        adc_code = adc_code_from_voltage(stress_u)
 
-    def step(self, dt, sensors):
-        self.runtime += dt
+        us_or = self.uz1 or self.uz2
 
-        self.adc_start_pulse = 0.02
-        adc_ready = True
+        # Only active in motion states
+        if self.state in ("OPENING", "CLOSING"):
+            # авария №1: любой УЗ
+            if us_or:
+                self.emergency_stop("УЗ: обнаружено препятствие (УЗ1/УЗ2)")
+                return adc_code
 
-        moving = self.state in ("OPENING", "CLOSING")
+            # авария №3: 95% предела упругости
+            if self.stress >= TH_95:
+                self.emergency_stop("Тензо ≥ 95 кгс/мм²")
+                return adc_code
 
-        if moving and (sensors["us1"] or sensors["us2"]):
-            self.emergency_stop("АС1: препятствие (УЗ)")
+            # авария №2: предел пропорциональности
+            if self.stress >= TH_70:
+                if not self.slow_mode_30:
+                    self.slow_mode_30 = True
+                    self.log("Тензо ≥ 70 → замедление до 30% по рис.Б.8б (5с)")
+                    self.start_ramp(CODE_SLOW, RAMP_DOWN_SEC)
+                # если в 30% — держим его (не вмешиваемся в КВ1)
+                return adc_code
 
-        if moving:
-            f = sensors["force"]
-            if f >= F_STOP:
-                self.emergency_stop("АС3: усилие >= 114")
-            elif f >= F_SLOW_ON:
-                self.apply_slow_force()
-            elif f < F_SLOW_OFF:
-                if self.slow_force:
-                    self.release_slow_force()
+            # выход из аварии №2 (обратимо)
+            if self.slow_mode_30 and self.stress < TH_55:
+                self.slow_mode_30 = False
+                nominal = self.nominal_target_code()
+                self.log("Тензо < 55 → восстановить номинальную скорость по рис.Б.8а (12с)")
+                self.start_ramp(nominal, RAMP_UP_SEC)
+                return adc_code
 
-        if moving:
+            # концевики (замедления по рис.Б.8б)
             if self.state == "OPENING":
-                if sensors["kv_open2"]:
-                    self.push_log("КВ2 ОТКРЫТО: останов")
-                    self.state = "IDLE"
-                    self.set_profile(0.0, T_RAMP_DOWN)
-                elif sensors["kv_open1"]:
-                    self.apply_slow_kv()
+                if self.kv_o2:
+                    self.normal_stop_to_zero("КВ_О2 сработал: конец открытия")
+                    return adc_code
+                if self.kv_o1 and not self.slow_mode_30:
+                    # if not already targeting half or below
+                    if self.target_code > CODE_HALF:
+                        self.log("КВ_О1 сработал: замедление до 50% по рис.Б.8б (5с)")
+                        self.start_ramp(CODE_HALF, RAMP_DOWN_SEC)
+                        return adc_code
 
-            elif self.state == "CLOSING":
-                if sensors["kv_close2"]:
-                    self.push_log("КВ2 ЗАКРЫТО: останов")
-                    self.state = "IDLE"
-                    self.set_profile(0.0, T_RAMP_DOWN)
-                elif sensors["kv_close1"]:
-                    self.apply_slow_kv()
+            if self.state == "CLOSING":
+                if self.kv_z2:
+                    self.normal_stop_to_zero("КВ_З2 сработал: конец закрытия")
+                    return adc_code
+                if self.kv_z1 and not self.slow_mode_30:
+                    if self.target_code > CODE_HALF:
+                        self.log("КВ_З1 сработал: замедление до 50% по рис.Б.8б (5с)")
+                        self.start_ramp(CODE_HALF, RAMP_DOWN_SEC)
+                        return adc_code
 
-        if self.profile is not None:
-            self.u_cmd = self.profile.step(dt)
-            if self.profile.done:
-                self.profile = None
+        return adc_code
 
-        self.dac_start_pulse = 0.02
-        return adc_ready
+    def update(self, dt):
+        # reset pulses each frame; set during control_step
+        self.zp_adc_pulse = False
+        self.zp_dac_pulse = False
 
-class World:
-    def __init__(self):
-        self.pos = 0.0
-        self.force = 0.0
-        self.us1 = False
-        self.us2 = False
+        # Update ramp continuously
+        if self.ramp.active:
+            self.dac_code, _ = self.ramp.update(dt)
+        else:
+            self.dac_code = int(self.target_code)
 
-    def compute_limit_switches(self):
-        kv_open1 = self.pos >= KV_OPEN1_POS
-        kv_open2 = self.pos >= KV_OPEN2_POS
-        kv_close1 = self.pos <= KV_CLOSE1_POS
-        kv_close2 = self.pos <= KV_CLOSE2_POS
-        return kv_open1, kv_open2, kv_close1, kv_close2
+        # Move gate according to current voltage and direction (only when OPENING/CLOSING)
+        u_out = dac_voltage_from_code(self.dac_code)
+        if self.state in ("OPENING", "CLOSING") and self.direction != 0:
+            # speed proportional to u_out / 116V
+            frac = 0.0 if U_NOM <= 1e-6 else (u_out / U_NOM)
+            frac = clamp(frac, 0.0, 1.2)
+            v = BASE_SPEED * frac
+            self.position += self.direction * v * dt
+            self.position = clamp(self.position, 0.0, 1.0)
 
-    def step(self, dt, ctrl: GateController):
-        u = clamp(ctrl.u_cmd, 0.0, U_NOM)
+        # Update limit switches from position
+        self.update_limits_from_position()
 
-        if ctrl.state in ("OPENING", "CLOSING") and not ctrl.stop_latched:
-            if ctrl.direction == 1:
-                v = OPEN_SPEED_AT_NOM * (u / U_NOM)
-                self.pos += v * dt
-            else:
-                v = CLOSE_SPEED_AT_NOM * (u / U_NOM)
-                self.pos -= v * dt
+        # Sampling / decision step each 0.25s
+        self.sample_timer += dt
+        adc_code = 0
+        while self.sample_timer >= SAMPLE_PERIOD:
+            self.sample_timer -= SAMPLE_PERIOD
+            adc_code = self.control_step()
 
-        self.pos = clamp(self.pos, POS_MIN, POS_MAX)
+        # If stopped by normal completion and ramp ended at 0 -> go IDLE
+        if self.state != "STOPPED":
+            if self.direction == 0 and self.target_code == 0 and not self.ramp.active:
+                self.state = "IDLE"
+                self.ko = False
+                self.kz = False
 
-    def sensors_snapshot(self):
-        kv_open1, kv_open2, kv_close1, kv_close2 = self.compute_limit_switches()
-        return {
-            "pos": self.pos,
-            "force": self.force,
-            "us1": self.us1,
-            "us2": self.us2,
-            "kv_open1": kv_open1,
-            "kv_open2": kv_open2,
-            "kv_close1": kv_close1,
-            "kv_close2": kv_close2,
-        }
+        # If STOPPED and voltage already 0 -> just wait for operator (O/C)
+        if self.state == "STOPPED" and self.target_code == 0 and not self.ramp.active:
+            self.ko = False
+            self.kz = False
 
+        # Build ports for UI
+        stress_u = tenso_to_voltage(self.stress)
+        adc_code_now = adc_code_from_voltage(stress_u)
+        port300 = self.build_port300(adc_code_now)
+        port301 = self.build_port301()
+        return port300, port301, adc_code_now, u_out, stress_u, (self.uz1 or self.uz2)
 
-pygame.init()
-W, H = 1400, 820
-screen = pygame.display.set_mode((W, H))
-pygame.display.set_caption("ИМИТАЦИОННАЯ МОДЕЛЬ: УПРАВЛЕНИЕ АВТОМАТИЧЕСКИМИ ВОРОТАМИ (Вариант 30)")
-clock = pygame.time.Clock()
+# -------------------- Drawing --------------------
+def draw_rect(surf, rect, color, w=1):
+    pygame.draw.rect(surf, color, rect, w)
 
-FONT = pygame.font.SysFont("consolas", 16)
-FONT_B = pygame.font.SysFont("consolas", 18, bold=True)
-FONT_S = pygame.font.SysFont("consolas", 14)
+def draw_text(surf, font, x, y, text, color=(230,230,230)):
+    img = font.render(text, True, color)
+    surf.blit(img, (x, y))
+    return img.get_height()
 
+def draw_bar(surf, rect, value01, label, color=(80,200,120), back=(50,50,50)):
+    pygame.draw.rect(surf, back, rect, 0)
+    w = int(rect.width * clamp(value01, 0.0, 1.0))
+    pygame.draw.rect(surf, color, pygame.Rect(rect.x, rect.y, w, rect.height), 0)
+    pygame.draw.rect(surf, (120,120,120), rect, 1)
+    # label
+    return
 
-def text(s, x, y, color=(220, 220, 220), bold=False):
-    surf = (FONT_B if bold else FONT).render(s, True, color)
-    screen.blit(surf, (x, y))
+def draw_graph(surf, rect, series, t_now, seconds=60.0):
+    # axes
+    pygame.draw.rect(surf, (60,60,60), rect, 1)
+    # grid
+    for i in range(1, 5):
+        y = rect.y + int(rect.height * i / 5)
+        pygame.draw.line(surf, (35,35,35), (rect.x, y), (rect.x + rect.width, y), 1)
+    for i in range(1, 6):
+        x = rect.x + int(rect.width * i / 6)
+        pygame.draw.line(surf, (35,35,35), (x, rect.y), (x, rect.y + rect.height), 1)
 
-
-def text_s(s, x, y, color=(220, 220, 220)):
-    surf = FONT_S.render(s, True, color)
-    screen.blit(surf, (x, y))
-
-
-def draw_panel(rect, title):
-    pygame.draw.rect(screen, (30, 30, 30), rect, border_radius=8)
-    pygame.draw.rect(screen, (80, 80, 80), rect, 1, border_radius=8)
-    text(title, rect.x + 10, rect.y + 8, (0, 200, 160), bold=True)
-
-
-def draw_bar(x, y, w, h, frac, label, color=(0, 220, 120)):
-    pygame.draw.rect(screen, (55, 55, 55), (x, y, w, h))
-    pygame.draw.rect(screen, (120, 120, 120), (x, y, w, h), 1)
-    fill = int(w * clamp(frac, 0.0, 1.0))
-    pygame.draw.rect(screen, color, (x, y, fill, h))
-    text(label, x, y - 18, (180, 180, 180))
-
-
-def draw_led(x, y, on, label, on_col=(255, 60, 60), off_col=(90, 90, 90)):
-    col = on_col if on else off_col
-    pygame.draw.circle(screen, col, (x, y), 8)
-    pygame.draw.circle(screen, (180, 180, 180), (x, y), 8, 1)
-    text(label, x + 14, y - 8, (220, 220, 220))
-
-
-def draw_graph(rect, values, vmin, vmax, color=(0, 220, 120), label=""):
-    pygame.draw.rect(screen, (15, 15, 15), rect)
-    pygame.draw.rect(screen, (100, 100, 100), rect, 1)
-    if label:
-        text(label, rect.x + 8, rect.y + 6, (180, 180, 180))
-    if len(values) < 2:
-        return
+    # plot last "seconds"
+    t0 = t_now - seconds
     pts = []
-    for i, v in enumerate(values):
-        x = rect.x + int(i * (rect.w - 2) / (len(values) - 1)) + 1
-        frac = (v - vmin) / (vmax - vmin) if vmax > vmin else 0.0
-        frac = clamp(frac, 0.0, 1.0)
-        y = rect.y + rect.h - int(frac * (rect.h - 2)) - 1
+    for (t, u) in series:
+        if t < t0:
+            continue
+        x = rect.x + int((t - t0) / seconds * rect.width)
+        y = rect.y + rect.height - int(clamp(u / DAC_VMAX, 0.0, 1.0) * rect.height)
         pts.append((x, y))
     if len(pts) >= 2:
-        pygame.draw.lines(screen, color, False, pts, 2)
+        pygame.draw.lines(surf, (120,220,255), False, pts, 2)
 
+# -------------------- Main --------------------
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Имитационная модель СРВ: автоматические ворота (вариант 30)")
+    clock = pygame.time.Clock()
 
-world = World()
-ctrl = GateController()
+    font = pygame.font.SysFont("consolas", 18)
+    font_small = pygame.font.SysFont("consolas", 16)
+    font_big = pygame.font.SysFont("consolas", 28)
 
-hist_len = 380
-hist_u = deque([0.0] * hist_len, maxlen=hist_len)
-hist_pos = deque([0.0] * hist_len, maxlen=hist_len)
-hist_force = deque([0.0] * hist_len, maxlen=hist_len)
+    log_lines = deque(maxlen=MAX_LOG_LINES)
 
-running = True
-while running:
-    dt = clock.tick(60) / 1000.0
+    def log(msg):
+        t = pygame.time.get_ticks() / 1000.0
+        mm = int(t // 60)
+        ss = int(t % 60)
+        log_lines.appendleft(f"[{mm:02d}:{ss:02d}] {msg}")
 
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
+    sysm = GateSystem(log)
+    log("Готово. O=открыть, C=закрыть, 1/2=УЗ, ↑/↓=усилие, R=сброс")
+
+    history = deque(maxlen=5000)
+
+    running = True
+    while running:
+        dt = clock.tick(60) / 1000.0
+        t_now = pygame.time.get_ticks() / 1000.0
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
                 running = False
 
-            if event.key == pygame.K_o:
-                ctrl.request_open()
-            if event.key == pygame.K_c:
-                ctrl.request_close()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
 
-            if event.key == pygame.K_1:
-                world.us1 = not world.us1
-                ctrl.push_log(f"УЗ1: {'ПОМЕХА' if world.us1 else 'норма'}")
-            if event.key == pygame.K_2:
-                world.us2 = not world.us2
-                ctrl.push_log(f"УЗ2: {'ПОМЕХА' if world.us2 else 'норма'}")
+                if event.key == pygame.K_o:
+                    sysm.press_open()
+                if event.key == pygame.K_c:
+                    sysm.press_close()
 
-            if event.key == pygame.K_r:
-                world.us1 = False
-                world.us2 = False
-                world.force = 0.0
-                ctrl.push_log("Сброс: УЗ=норма, усилие=0")
+                if event.key == pygame.K_1:
+                    sysm.uz1 = not sysm.uz1
+                    log(f"УЗ1 = {fmt_bool(sysm.uz1)}")
+                if event.key == pygame.K_2:
+                    sysm.uz2 = not sysm.uz2
+                    log(f"УЗ2 = {fmt_bool(sysm.uz2)}")
 
-            if event.key == pygame.K_UP:
-                world.force = clamp(world.force + 2.0, 0.0, 120.0)
-            if event.key == pygame.K_DOWN:
-                world.force = clamp(world.force - 2.0, 0.0, 120.0)
+                if event.key == pygame.K_r:
+                    sysm.reset_sensors()
 
-    ctrl.adc_start_pulse = max(0.0, ctrl.adc_start_pulse - dt)
-    ctrl.dac_start_pulse = max(0.0, ctrl.dac_start_pulse - dt)
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_UP]:
+            sysm.stress = clamp(sysm.stress + 25.0 * dt, 0.0, TENSO_MAX)
+        if keys[pygame.K_DOWN]:
+            sysm.stress = clamp(sysm.stress - 25.0 * dt, 0.0, TENSO_MAX)
 
-    sensors = world.sensors_snapshot()
-    adc_ready = ctrl.step(dt, sensors)
-    world.step(dt, ctrl)
+        port300, port301, adc_code, u_out, stress_u, us_or = sysm.update(dt)
 
-    ten_u = ten_voltage_from_force(world.force)
-    adc_code = adc_code_from_voltage(ten_u)
+        # history for graph
+        history.append((t_now, u_out))
 
-    dac_u = clamp(ctrl.u_cmd, 0.0, DAC_U_MAX)
-    dac_code = dac_code_from_voltage(dac_u)
+        # -------------------- Layout --------------------
+        screen.fill((18, 18, 22))
 
-    sensors = world.sensors_snapshot()
+        # panels
+        left = pygame.Rect(20, 20, 520, 860)
+        mid = pygame.Rect(560, 20, 720, 860)
+        right = pygame.Rect(1300, 20, 280, 860)
 
-    hist_u.append(dac_u)
-    hist_pos.append(sensors["pos"])
-    hist_force.append(world.force)
+        draw_rect(screen, left, (70,70,70), 1)
+        draw_rect(screen, mid, (70,70,70), 1)
+        draw_rect(screen, right, (70,70,70), 1)
 
-    in_port = 0
-    in_port |= (adc_code & 0xFF)
-    in_port |= (1 << 8) if sensors["kv_open1"] else 0
-    in_port |= (1 << 9) if sensors["kv_open2"] else 0
-    in_port |= (1 << 10) if sensors["kv_close1"] else 0
-    in_port |= (1 << 11) if sensors["kv_close2"] else 0
-    in_port |= (1 << 12) if world.us1 else 0
-    in_port |= (1 << 13) if world.us2 else 0
-    in_port |= (1 << 15) if adc_ready else 0
+        # Title
+        draw_text(screen, font_big, 30, 30, "УПРАВЛЕНИЕ ВОРОТАМИ — ВАРИАНТ 30", (200,230,255))
 
-    out_port = 0
-    out_port |= (dac_code & 0xFF)
-    out_port |= (1 << 8) if ctrl.direction == 1 else 0
-    out_port |= (1 << 14) if ctrl.dac_start_pulse > 0 else 0
-    out_port |= (1 << 15) if ctrl.adc_start_pulse > 0 else 0
+        # -------- Left panel: sensors / ports --------
+        y = 80
+        draw_text(screen, font, 40, y, "ДАТЧИКИ / СИГНАЛЫ (порт 300h)", (180,220,180)); y += 30
 
-    screen.fill((0, 0, 0))
+        draw_text(screen, font, 40, y, f"KO (кнопка ОТКР): {fmt_bool(sysm.ko)}   (O)", (220,220,220)); y += 24
+        draw_text(screen, font, 40, y, f"KZ (кнопка ЗАКР): {fmt_bool(sysm.kz)}   (C)", (220,220,220)); y += 24
+        y += 6
+        draw_text(screen, font, 40, y, f"УЗ1: {fmt_bool(sysm.uz1)} (1)   УЗ2: {fmt_bool(sysm.uz2)} (2)   US(OR): {fmt_bool(us_or)}", (220,180,180)); y += 24
+        y += 6
 
-    text("УПРАВЛЕНИЕ ВОРОТАМИ (вариант 30) | O=Открыть  C=Закрыть  1/2=УЗ  ↑↓=усилие  R=сброс  Esc=выход",
-         20, 12, (200, 200, 200))
+        draw_text(screen, font, 40, y, f"КВ_О1: {fmt_bool(sysm.kv_o1)}   КВ_О2: {fmt_bool(sysm.kv_o2)}", (220,220,220)); y += 24
+        draw_text(screen, font, 40, y, f"КВ_З1: {fmt_bool(sysm.kv_z1)}   КВ_З2: {fmt_bool(sysm.kv_z2)}", (220,220,220)); y += 24
+        y += 10
 
-    left = pygame.Rect(20, 50, 420, 740)
-    mid = pygame.Rect(460, 50, 660, 500)
-    right = pygame.Rect(1140, 50, 240, 740)
+        draw_text(screen, font, 40, y, f"Тензо: {sysm.stress:6.1f} кгс/мм²   Uдатч={stress_u:5.2f}В   АЦП={adc_code:3d} (0x{adc_code:02X})", (220,220,220)); y += 24
 
-    draw_panel(left, "ДАТЧИКИ / СОСТОЯНИЕ")
-    draw_panel(mid, "ИСТОРИЯ / ГРАФИКИ")
-    draw_panel(right, "ТЕКУЩИЙ РЕЖИМ / УПРАВЛЕНИЕ")
+        # Stress bar
+        bar = pygame.Rect(40, y+10, 460, 18)
+        draw_bar(screen, bar, sysm.stress / TENSO_MAX, "stress")
+        draw_text(screen, font_small, 40, y+32, "↑/↓ — изменить усилие", (160,160,160))
+        y += 70
 
-    y = left.y + 40
-    text(f"Время работы: {ctrl.runtime:6.1f} c", left.x + 14, y); y += 22
+        draw_text(screen, font, 40, y, f"Порт 300h (вход):  0x{port300:04X}", (180,200,255)); y += 26
+        draw_text(screen, font, 40, y, "Биты: 15 GT | 14 KZ | 13 KO | 12 US | 11 З2 | 10 З1 | 9 О2 | 8 О1 | 7..0 АЦП", (140,140,140)); y += 40
 
-    pos_frac = (sensors["pos"] - POS_MIN) / (POS_MAX - POS_MIN)
-    draw_bar(left.x + 14, y + 10, left.w - 28, 16, pos_frac, f"Позиция створок: {sensors['pos']:5.1f}%")
-    y += 46
+        draw_text(screen, font, 40, y, f"Порт 301h (выход): 0x{port301:04X}", (180,200,255)); y += 26
+        draw_text(screen, font, 40, y, "Биты: 15 ZP_АЦП | 14 ZP_ЦАП | 7..0 Данные ЦАП", (140,140,140)); y += 40
 
-    text("Концевые выключатели:", left.x + 14, y, (120, 200, 255)); y += 22
-    draw_led(left.x + 24, y + 8, sensors["kv_open1"], "КВ Откр.1 (>=90%)"); y += 22
-    draw_led(left.x + 24, y + 8, sensors["kv_open2"], "КВ Откр.2 (=100%)", on_col=(255, 170, 60)); y += 22
-    draw_led(left.x + 24, y + 8, sensors["kv_close1"], "КВ Закр.1 (<=10%)"); y += 22
-    draw_led(left.x + 24, y + 8, sensors["kv_close2"], "КВ Закр.2 (=0%)", on_col=(255, 170, 60)); y += 34
+        draw_text(screen, font, 40, y, f"ЦАП код: {sysm.dac_code:3d} (0x{sysm.dac_code:02X})  -> Uвых={u_out:6.1f} В", (220,220,220)); y += 24
 
-    text("Ультразвуковые датчики:", left.x + 14, y, (120, 200, 255)); y += 22
-    draw_led(left.x + 24, y + 8, world.us1, "УЗ1: препятствие", on_col=(255, 60, 60), off_col=(0, 160, 80)); y += 22
-    draw_led(left.x + 24, y + 8, world.us2, "УЗ2: препятствие", on_col=(255, 60, 60), off_col=(0, 160, 80)); y += 34
+        # Position bar
+        draw_text(screen, font, 40, y+20, f"Положение створок: {sysm.position*100:5.1f}%", (220,220,220))
+        bar2 = pygame.Rect(40, y+50, 460, 18)
+        draw_bar(screen, bar2, sysm.position, "pos", color=(200,180,80))
+        y += 90
 
-    text("Тензодатчик:", left.x + 14, y, (120, 200, 255)); y += 22
-    text(f"Усилие: {world.force:6.1f} кгс/мм^2", left.x + 14, y); y += 20
-    text(f"U(тенз): {ten_u:6.2f} V   (0..15V)", left.x + 14, y); y += 20
-    text(f"АЦП (8 бит, 0..19.5V): {hex8(adc_code)} ({adc_code})", left.x + 14, y); y += 24
+        # -------- Mid panel: graph + log --------
+        draw_text(screen, font, 580, 40, "ИСТОРИЯ НАПРЯЖЕНИЯ НА ЭЛЕКТРОПРИВОДЕ (0..120В)", (200,230,255))
+        graph = pygame.Rect(580, 80, 680, 360)
+        draw_graph(screen, graph, history, t_now, seconds=60.0)
 
-    text("Пороги (тензодатчик):", left.x + 14, y, (200, 180, 120)); y += 18
-    text("  >=70  -> замедление 30%  (код ~114 / 0x72)", left.x + 14, y, (200, 180, 120)); y += 18
-    text("  <55   -> восстановление (код ~90  / 0x5A)", left.x + 14, y, (200, 180, 120)); y += 18
-    text("  >=114 -> аварийный стоп (код ~186 / 0xBA)", left.x + 14, y, (200, 180, 120)); y += 22
+        # Mark reference lines (116, 58, 34.8)
+        for u, label in [(U_NOM, "116В"), (U_HALF, "58В"), (U_SLOW, "34.8В")]:
+            yline = graph.y + graph.height - int(clamp(u / DAC_VMAX, 0.0, 1.0) * graph.height)
+            pygame.draw.line(screen, (60,60,60), (graph.x, yline), (graph.x + graph.width, yline), 1)
+            draw_text(screen, font_small, graph.x + graph.width + 10, yline - 8, label, (140,140,140))
 
-    text("СОСТОЯНИЕ ПОРТОВ УСРР:", left.x + 14, y, (0, 220, 180), bold=True); y += 24
-    text(f"Порт 300h (вход):  {hex16(in_port)}", left.x + 14, y); y += 20
-    text(" 0..7  АЦП | 8 Откр1 | 9 Откр2 | 10 Закр1 | 11 Закр2", left.x + 14, y); y += 18
-    text(" 12 УЗ1 | 13 УЗ2 | 15 ГТ(АЦП)", left.x + 14, y); y += 22
-    text(f"Порт 301h (выход): {hex16(out_port)}", left.x + 14, y); y += 20
-    text(" 0..7 ЦАП | 8 Напр.(1=Откр) | 14 ЗП(ЦАП) | 15 ЗП(АЦП)", left.x + 14, y); y += 18
+        # Event log area
+        draw_text(screen, font, 580, 470, "ЖУРНАЛ СОБЫТИЙ (последние строки, без скролла)", (200,230,255))
+        log_rect = pygame.Rect(580, 500, 680, 360)
+        pygame.draw.rect(screen, (30,30,34), log_rect, 0)
+        pygame.draw.rect(screen, (60,60,60), log_rect, 1)
 
-    gx = mid.x + 14
-    gy = mid.y + 40
-    g1 = pygame.Rect(gx, gy, mid.w - 28, 150)
-    g2 = pygame.Rect(gx, gy + 170, mid.w - 28, 150)
-    g3 = pygame.Rect(gx, gy + 340, mid.w - 28, 140)
+        yy = log_rect.y + 10
+        for line in list(log_lines):
+            draw_text(screen, font_small, log_rect.x + 10, yy, line, (220,220,220))
+            yy += 24
 
-    draw_graph(g1, list(hist_u), 0.0, 120.0, color=(0, 220, 120), label="Uупр (ЦАП), В (0..120)")
-    draw_graph(g2, list(hist_pos), 0.0, 100.0, color=(120, 200, 255), label="Позиция ворот, % (0..100)")
-    draw_graph(g3, list(hist_force), 0.0, 120.0, color=(255, 180, 60), label="Усилие, кгс/мм^2 (0..120)")
+        # -------- Right panel: current mode --------
+        draw_text(screen, font, 1320, 40, "ТЕКУЩИЙ РЕЖИМ", (200,230,255))
+        mode_box = pygame.Rect(1320, 80, 240, 120)
+        pygame.draw.rect(screen, (28,28,32), mode_box, 0)
+        pygame.draw.rect(screen, (80,80,80), mode_box, 1)
 
-    ry = right.y + 40
-    mode_col = (0, 200, 120)
-    if ctrl.state == "OPENING":
-        mode_col = (120, 200, 255)
-    elif ctrl.state == "CLOSING":
-        mode_col = (255, 200, 120)
-    elif ctrl.state == "STOPPED":
-        mode_col = (255, 60, 60)
+        mode_color = (120,220,255)
+        if sysm.state == "STOPPED":
+            mode_color = (255,110,110)
+        elif sysm.state == "OPENING":
+            mode_color = (120,255,160)
+        elif sysm.state == "CLOSING":
+            mode_color = (255,200,120)
 
-    text("Состояние:", right.x + 14, ry, (180, 180, 180)); ry += 22
-    text(ctrl.state, right.x + 14, ry, mode_col, bold=True); ry += 26
-    text(f"Uупр: {dac_u:6.1f} В", right.x + 14, ry); ry += 18
-    text(f"Код ЦАП: {hex8(dac_code)} ({dac_code})", right.x + 14, ry); ry += 18
-    text(f"slow_force: {'ДА' if ctrl.slow_force else 'нет'}", right.x + 14, ry, (200, 180, 120)); ry += 18
-    text(f"slow_kv:    {'ДА' if ctrl.slow_kv else 'нет'}", right.x + 14, ry, (200, 180, 120)); ry += 22
+        draw_text(screen, font_big, 1340, 110, sysm.state, mode_color)
+        draw_text(screen, font_small, 1340, 150, f"slow30: {fmt_bool(sysm.slow_mode_30)}", (220,220,220))
 
-    card = pygame.Rect(right.x + 14, ry, right.w - 28, 110)
-    pygame.draw.rect(screen, (25, 25, 25), card, border_radius=8)
-    pygame.draw.rect(screen, mode_col, card, 2, border_radius=8)
+        # Show what the controller tries to do
+        draw_text(screen, font, 1320, 230, "ЦЕЛЕВОЙ УРОВЕНЬ", (200,230,255))
+        target_u = dac_voltage_from_code(sysm.target_code)
+        draw_text(screen, font, 1320, 260, f"target: {sysm.target_code:3d} (0x{sysm.target_code:02X})", (220,220,220))
+        draw_text(screen, font, 1320, 286, f"Utarget: {target_u:6.1f} В", (220,220,220))
 
-    if ctrl.state == "IDLE":
-        desc = ["Ожидание", "U=0, привод стоп"]
-    elif ctrl.state == "OPENING":
-        desc = ["Открытие", "Контроль УЗ/усилия/КВ"]
-    elif ctrl.state == "CLOSING":
-        desc = ["Закрытие", "Контроль УЗ/усилия/КВ"]
-    else:
-        desc = ["АВАРИЯ / STOP", "Перезапуск кнопкой"]
+        draw_text(screen, font, 1320, 340, "ПРАВИЛА (кратко)", (200,230,255))
+        rules = [
+            "O/C: старт, разгон 12с",
+            "КВ1: до 50% за 5с",
+            "КВ2: до 0 за 5с",
+            "УЗ или тензо>=95: стоп",
+            "тензо>=70: до 30% (5с)",
+            "тензо<55: возврат (12с)"
+        ]
+        yy = 370
+        for r in rules:
+            draw_text(screen, font_small, 1320, yy, "- " + r, (190,190,190))
+            yy += 22
 
-    text("РЕЖИМ", card.x + 10, card.y + 10, mode_col, bold=True)
-    for i, line in enumerate(desc):
-        text(line, card.x + 10, card.y + 40 + i * 18, (220, 220, 220))
+        draw_text(screen, font_small, 1320, 850, "O/C/1/2/↑/↓/R, Esc", (140,140,140))
 
-    ry += 130
-    text("Журнал событий:", right.x + 14, ry, (180, 180, 180)); ry += 22
+        pygame.display.flip()
 
-    log_box = pygame.Rect(right.x + 14, ry, right.w - 28, right.h - (ry - right.y) - 14)
-    pygame.draw.rect(screen, (15, 15, 15), log_box, border_radius=8)
-    pygame.draw.rect(screen, (80, 80, 80), log_box, 1, border_radius=8)
+    pygame.quit()
+    sys.exit()
 
-    max_text_w = log_box.w - 20
-    ly = log_box.y + 10
-
-    for s in list(ctrl.log):
-        for line in wrap_lines(s, FONT_S, max_text_w):
-            if ly > log_box.y + log_box.h - 18:
-                break
-            text_s(line, log_box.x + 10, ly, (200, 200, 200))
-            ly += 16
-        if ly > log_box.y + log_box.h - 18:
-            break
-
-    pygame.display.flip()
-
-pygame.quit()
-sys.exit()
+if __name__ == "__main__":
+    main()
